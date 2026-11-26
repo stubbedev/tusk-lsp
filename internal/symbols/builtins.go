@@ -118,6 +118,15 @@ type BuiltinProfile struct {
 type BuiltinAvailability struct {
 	Since     string
 	Extension string
+	Removed   string
+}
+
+func (a BuiltinAvailability) RemovedBy(version string) bool {
+	return a.Removed != "" && compareBuiltinVersions(a.Removed, version) <= 0
+}
+
+func (a BuiltinAvailability) InVersion(version string) bool {
+	return (a.Since == "" || compareBuiltinVersions(a.Since, version) <= 0) && !a.RemovedBy(version)
 }
 
 var builtinAvailabilityByName = map[string]BuiltinAvailability{
@@ -302,7 +311,7 @@ func builtinAvailable(name string, profile BuiltinProfile) bool {
 	if !ok {
 		return true
 	}
-	if availability.Since != "" && compareBuiltinVersions(availability.Since, profile.PHPVersion) > 0 {
+	if !availability.InVersion(profile.PHPVersion) {
 		return false
 	}
 	if availability.Extension != "" {
