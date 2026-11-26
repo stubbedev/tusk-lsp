@@ -2,9 +2,27 @@
 
 declare(strict_types=1);
 
-function classLikeDumpCode(): string
+/**
+ * PHP code, run in each build, that starts its dump: the version, the loaded
+ * extensions, and the static ones, which a run without any ini file (-n)
+ * still loads.
+ */
+function dumpHeaderCode(): string
 {
     return <<<'PHP'
+$static = json_decode((string) shell_exec(escapeshellarg(PHP_BINARY) . ' -n -r ' . escapeshellarg('echo json_encode(array_map("strtolower", get_loaded_extensions()));')), true);
+if (!is_array($static)) {
+    fwrite(STDERR, "Can't list the static extensions of " . PHP_BINARY . "\n");
+    exit(1);
+}
+$out = ['version' => PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION, 'extensions' => array_map('strtolower', get_loaded_extensions()), 'static' => $static];
+
+PHP;
+}
+
+function classLikeDumpCode(): string
+{
+    return dumpHeaderCode() . <<<'PHP'
 $type = function ($t) use (&$type) {
     if ($t === null) {
         return '';
@@ -33,7 +51,7 @@ $visibility = function ($m) {
     return $m->isProtected() ? 'protected' : 'public';
 };
 $names = array_merge(get_declared_classes(), get_declared_interfaces(), get_declared_traits());
-$out = ['version' => PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION, 'extensions' => array_map('strtolower', get_loaded_extensions()), 'classes' => []];
+$out['classes'] = [];
 foreach ($names as $name) {
     $c = new ReflectionClass($name);
     if (!$c->isInternal()) {
@@ -90,18 +108,17 @@ PHP;
 /**
  * The version that added something first seen in $first: that version, when an
  * earlier build had the extension it belongs to without it, or when the
- * extension is one PHP's default builds have (an earlier default build without
- * it means the extension came with $first, as random did with 8.2). Something
- * of another extension no earlier build had is of unknown age: ''.
+ * extension came with a later PHP (an introduced extension: random with 8.2).
+ * Something of another extension no earlier build had is of unknown age: ''.
  *
- * @param array<string, true> $defaultExtensions
+ * @param array<string, true> $introducedExtensions
  */
-function addedIn(string $first, string $extension, array $dumps, array $defaultExtensions): string
+function addedIn(string $first, string $extension, array $dumps, array $introducedExtensions): string
 {
     if ($first === $dumps[0]['version']) {
         return '';
     }
-    if (isset($defaultExtensions[$extension])) {
+    if (isset($introducedExtensions[$extension])) {
         return $first;
     }
     foreach ($dumps as $dump) {
@@ -123,6 +140,7 @@ function addedIn(string $first, string $extension, array $dumps, array $defaultE
 function generateGoClassLikes(array $defaultDumps, array $extensionDumps, array $peclDumps, string $extensionStubsDir): string
 {
     $defaultExtensions = loadedExtensions($defaultDumps);
+    $introducedExtensions = introducedExtensions($defaultDumps);
     $phpSourceExtensions = loadedExtensions(array_merge($defaultDumps, $extensionDumps));
     $stubClasses = extensionStubClassLikes($extensionStubsDir, $defaultExtensions);
     $stubExtensions = array_flip(array_column($stubClasses, 1));
@@ -163,9 +181,9 @@ function generateGoClassLikes(array $defaultDumps, array $extensionDumps, array 
 
     $lines = [];
     foreach ($latest as $name => $class) {
-        $since = static function (string $group, string $member) use ($memberFirst, $name, $first, $class, $dumps, $defaultExtensions): ?string {
+        $since = static function (string $group, string $member) use ($memberFirst, $name, $first, $class, $dumps, $introducedExtensions): ?string {
             $at = $memberFirst[$name][$group][$member];
-            return $at === $first[$name] ? null : goStringOrNull(addedIn($at, $class['extension'], $dumps, $defaultExtensions));
+            return $at === $first[$name] ? null : goStringOrNull(addedIn($at, $class['extension'], $dumps, $introducedExtensions));
         };
         $removed = static function (string $group, string $member) use ($memberLast, $name, $classVersions): ?string {
             $last = $memberLast[$name][$group][$member];
@@ -227,7 +245,7 @@ function generateGoClassLikes(array $defaultDumps, array $extensionDumps, array 
             'IsFinal' => goTrueOrNull($class['final']),
             'Extends' => goStringOrNull($class['extends']),
             'Implements' => $class['implements'] === [] ? null : '[]string{' . implode(', ', array_map('renderGoString', $class['implements'])) . '}',
-            'Since' => goStringOrNull(addedIn($first[$name], $class['extension'], $dumps, $defaultExtensions)),
+            'Since' => goStringOrNull(addedIn($first[$name], $class['extension'], $dumps, $introducedExtensions)),
             'Extension' => goStringOrNull(isset($peclExtensions[$class['extension']]) ? $class['extension'] : ''),
             'Members' => $members === [] ? null : "[]builtinMember{\n" . implode('', array_map(static fn(string $m): string => "\t\t" . $m . ",\n", $members)) . "\t}",
         ]) . ',';
@@ -246,6 +264,34 @@ function generateGoClassLikes(array $defaultDumps, array $extensionDumps, array 
         '}',
         '',
     ]);
+}
+
+/**
+ * Extensions PHP gained after the oldest default build: ones compiled into
+ * the first default build that has them, so every build of that version has
+ * them and no earlier one did. An extension that first shows up as a shared
+ * one (opcache in the 8.1 images) may simply not have been enabled before.
+ *
+ * @param list<array{version:string, extensions:list<string>, static:list<string>}> $defaultDumps
+ * @return array<string, true>
+ */
+function introducedExtensions(array $defaultDumps): array
+{
+    usort($defaultDumps, static fn(array $a, array $b): int => version_compare($a['version'], $b['version']));
+    $seen = [];
+    $introduced = [];
+    foreach ($defaultDumps as $i => $dump) {
+        foreach ($dump['extensions'] as $extension) {
+            if (isset($seen[$extension])) {
+                continue;
+            }
+            $seen[$extension] = true;
+            if ($i > 0 && in_array($extension, $dump['static'], true)) {
+                $introduced[$extension] = true;
+            }
+        }
+    }
+    return $introduced;
 }
 
 /**
@@ -274,6 +320,23 @@ function loadedExtensions(array $dumps): array
 function extensionStubClassLikes(string $dir, array $defaultExtensions): array
 {
     $out = [];
+    foreach (extensionStubSources($dir, $defaultExtensions) as [$extension, $source]) {
+        foreach (declaredClassLikes($source) as $name => $kind) {
+            $out[$name] = [$kind, $extension];
+        }
+    }
+    return $out;
+}
+
+/**
+ * The PHP files under internal/stubs/php/extensions/<extension>/, in path
+ * order, with their extension, leaving out extensions of the default builds.
+ *
+ * @param array<string, true> $defaultExtensions
+ * @return list<array{0:string, 1:string}>
+ */
+function extensionStubSources(string $dir, array $defaultExtensions): array
+{
     $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS));
     $paths = [];
     foreach ($files as $info) {
@@ -282,6 +345,7 @@ function extensionStubClassLikes(string $dir, array $defaultExtensions): array
         }
     }
     sort($paths, SORT_STRING);
+    $out = [];
     foreach ($paths as $file) {
         $extension = strtolower(explode('/', substr($file, strlen($dir) + 1))[0]);
         if (isset($defaultExtensions[$extension])) {
@@ -292,16 +356,11 @@ function extensionStubClassLikes(string $dir, array $defaultExtensions): array
             fwrite(STDERR, "Can't read {$file}\n");
             exit(1);
         }
-        foreach (declaredClassLikes($source) as $name => $kind) {
-            $out[$name] = [$kind, $extension];
-        }
+        $out[] = [$extension, $source];
     }
     return $out;
 }
 
-/**
- * @return array<string, string> the kind of each class-like a PHP file declares, by fully qualified name
- */
 function declaredClassLikes(string $source): array
 {
     $tokens = array_values(array_filter(
@@ -386,7 +445,7 @@ function sortedKeys(array $map): array
 
 return [
     'name' => 'classes',
-    'usage' => 'php scripts/generate-builtins.php classes --php=COMMANDS [--output=PATH]',
+    'usage' => 'php scripts/generate-builtins.php classes --php=COMMANDS [--extensions-php=COMMANDS] [--pecl-php=COMMANDS] [--output=PATH]',
     'help' => '  classes       Run each PHP given with --php and emit the Go table of PHP\'s
                 built-in classes, interfaces, traits and enums with their
                 public and protected methods, properties and constants, the
