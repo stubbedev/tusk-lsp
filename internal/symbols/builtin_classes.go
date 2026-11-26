@@ -7,6 +7,8 @@ type builtinClassLike struct {
 	IsFinal    bool
 	Extends    string
 	Implements []string
+	Since      string
+	Extension  string
 	Members    []builtinMember
 }
 
@@ -24,6 +26,18 @@ type builtinMember struct {
 	Params     []ParamInfo
 	Since      string
 	Removed    string
+}
+
+var generatedBuiltinClassAvailability = builtinClassAvailability(generatedBuiltinClassLikes)
+
+func builtinClassAvailability(classes []builtinClassLike) map[string]BuiltinAvailability {
+	out := make(map[string]BuiltinAvailability)
+	for _, c := range classes {
+		if c.Since != "" || c.Extension != "" {
+			out[c.Name] = BuiltinAvailability{Since: c.Since, Extension: c.Extension}
+		}
+	}
+	return out
 }
 
 func (idx *Index) addBuiltinClassLikeWithMembersLocked(c builtinClassLike, profile BuiltinProfile) {

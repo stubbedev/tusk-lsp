@@ -89,13 +89,20 @@ PHP;
 
 /**
  * The version that added something first seen in $first: that version, when an
- * earlier build had the extension it belongs to without it. Something of an
- * extension no earlier build had is taken to be as old as the baseline.
+ * earlier build had the extension it belongs to without it, or when the
+ * extension is one PHP's default builds have (an earlier default build without
+ * it means the extension came with $first, as random did with 8.2). Something
+ * of another extension no earlier build had is of unknown age: ''.
+ *
+ * @param array<string, true> $defaultExtensions
  */
-function addedIn(string $first, string $extension, array $dumps): string
+function addedIn(string $first, string $extension, array $dumps, array $defaultExtensions): string
 {
     if ($first === $dumps[0]['version']) {
         return '';
+    }
+    if (isset($defaultExtensions[$extension])) {
+        return $first;
     }
     foreach ($dumps as $dump) {
         if (version_compare($dump['version'], $first, '>=')) {
@@ -109,10 +116,20 @@ function addedIn(string $first, string $extension, array $dumps): string
 }
 
 /**
- * @param list<array{version:string, extensions:list<string>, classes:array<string, array>}> $dumps
+ * @param list<array{version:string, extensions:list<string>, classes:array<string, array>}> $defaultDumps
+ * @param list<array{version:string, extensions:list<string>, classes:array<string, array>}> $extensionDumps
+ * @param list<array{version:string, extensions:list<string>, classes:array<string, array>}> $peclDumps
  */
-function generateGoClassLikes(array $dumps): string
+function generateGoClassLikes(array $defaultDumps, array $extensionDumps, array $peclDumps, string $extensionStubsDir): string
 {
+    $defaultExtensions = loadedExtensions($defaultDumps);
+    $phpSourceExtensions = loadedExtensions(array_merge($defaultDumps, $extensionDumps));
+    $stubClasses = extensionStubClassLikes($extensionStubsDir, $defaultExtensions);
+    $stubExtensions = array_flip(array_column($stubClasses, 1));
+    $peclExtensions = array_diff_key(loadedExtensions($peclDumps), $phpSourceExtensions) + $stubExtensions;
+    $dumps = array_merge($defaultDumps, $extensionDumps, $peclDumps);
+    usort($dumps, static fn(array $a, array $b): int => version_compare($a['version'], $b['version']));
+
     $first = [];
     $latest = [];
     $memberFirst = [];
@@ -120,6 +137,9 @@ function generateGoClassLikes(array $dumps): string
     $classVersions = [];
     foreach ($dumps as $dump) {
         foreach ($dump['classes'] as $name => $class) {
+            if (isset($stubExtensions[$class['extension']])) {
+                continue;
+            }
             $first[$name] ??= $dump['version'];
             $classVersions[$name][$dump['version']] = true;
             $merged = $class;
@@ -133,13 +153,19 @@ function generateGoClassLikes(array $dumps): string
             $latest[$name] = $merged;
         }
     }
+
+    foreach ($stubClasses as $name => [$kind, $extension]) {
+        $latest[$name] ??= ['kind' => $kind, 'extension' => $extension, 'abstract' => false, 'final' => false, 'extends' => '', 'implements' => [],
+            'methods' => [], 'properties' => [], 'constants' => [], 'cases' => []];
+        $first[$name] ??= $dumps[0]['version'];
+    }
     ksort($latest, SORT_STRING);
 
     $lines = [];
     foreach ($latest as $name => $class) {
-        $since = static function (string $group, string $member) use ($memberFirst, $name, $first, $class, $dumps): ?string {
+        $since = static function (string $group, string $member) use ($memberFirst, $name, $first, $class, $dumps, $defaultExtensions): ?string {
             $at = $memberFirst[$name][$group][$member];
-            return $at === $first[$name] ? null : goStringOrNull(addedIn($at, $class['extension'], $dumps));
+            return $at === $first[$name] ? null : goStringOrNull(addedIn($at, $class['extension'], $dumps, $defaultExtensions));
         };
         $removed = static function (string $group, string $member) use ($memberLast, $name, $classVersions): ?string {
             $last = $memberLast[$name][$group][$member];
@@ -201,6 +227,8 @@ function generateGoClassLikes(array $dumps): string
             'IsFinal' => goTrueOrNull($class['final']),
             'Extends' => goStringOrNull($class['extends']),
             'Implements' => $class['implements'] === [] ? null : '[]string{' . implode(', ', array_map('renderGoString', $class['implements'])) . '}',
+            'Since' => goStringOrNull(addedIn($first[$name], $class['extension'], $dumps, $defaultExtensions)),
+            'Extension' => goStringOrNull(isset($peclExtensions[$class['extension']]) ? $class['extension'] : ''),
             'Members' => $members === [] ? null : "[]builtinMember{\n" . implode('', array_map(static fn(string $m): string => "\t\t" . $m . ",\n", $members)) . "\t}",
         ]) . ',';
     }
@@ -218,6 +246,92 @@ function generateGoClassLikes(array $dumps): string
         '}',
         '',
     ]);
+}
+
+/**
+ * @param list<array{version:string, extensions:list<string>, classes:array<string, array>}> $dumps
+ * @return array<string, true>
+ */
+function loadedExtensions(array $dumps): array
+{
+    $out = [];
+    foreach ($dumps as $dump) {
+        foreach ($dump['extensions'] as $extension) {
+            $out[$extension] = true;
+        }
+    }
+    return $out;
+}
+
+/**
+ * The class-likes the embedded stubs of an optional extension declare, each
+ * needing that extension: internal/stubs/php/extensions/<extension>/. The
+ * stubs are those classes' source; a build's reflection of them is not used.
+ *
+ * @param array<string, true> $defaultExtensions
+ * @return array<string, array{0:string, 1:string}> kind and extension by name
+ */
+function extensionStubClassLikes(string $dir, array $defaultExtensions): array
+{
+    $out = [];
+    $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS));
+    $paths = [];
+    foreach ($files as $info) {
+        if ($info->getExtension() === 'php') {
+            $paths[] = $info->getPathname();
+        }
+    }
+    sort($paths, SORT_STRING);
+    foreach ($paths as $file) {
+        $extension = strtolower(explode('/', substr($file, strlen($dir) + 1))[0]);
+        if (isset($defaultExtensions[$extension])) {
+            continue;
+        }
+        $source = file_get_contents($file);
+        if ($source === false) {
+            fwrite(STDERR, "Can't read {$file}\n");
+            exit(1);
+        }
+        foreach (declaredClassLikes($source) as $name => $kind) {
+            $out[$name] = [$kind, $extension];
+        }
+    }
+    return $out;
+}
+
+/**
+ * @return array<string, string> the kind of each class-like a PHP file declares, by fully qualified name
+ */
+function declaredClassLikes(string $source): array
+{
+    $tokens = array_values(array_filter(
+        token_get_all($source),
+        static fn($t): bool => !is_array($t) || !in_array($t[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)
+    ));
+    $namespace = '';
+    $names = [];
+    foreach ($tokens as $i => $token) {
+        if (!is_array($token)) {
+            continue;
+        }
+        if ($token[0] === T_NAMESPACE) {
+            $next = $tokens[$i + 1] ?? null;
+            $namespace = is_array($next) && in_array($next[0], [T_STRING, T_NAME_QUALIFIED], true) ? $next[1] . '\\' : '';
+            continue;
+        }
+        if (!in_array($token[0], [T_CLASS, T_INTERFACE, T_TRAIT, T_ENUM], true)) {
+            continue;
+        }
+        $previous = $tokens[$i - 1] ?? null;
+        if (is_array($previous) && in_array($previous[0], [T_DOUBLE_COLON, T_NEW], true)) {
+            continue;
+        }
+        $next = $tokens[$i + 1] ?? null;
+        if (is_array($next) && $next[0] === T_STRING) {
+            $names[$namespace . $next[1]] = match ($token[0]) { T_INTERFACE => 'interface', T_TRAIT => 'trait', T_ENUM => 'enum', default => 'class' };
+        }
+    }
+    return $names;
 }
 
 /**
@@ -288,7 +402,12 @@ return [
             exit(1);
         }
         writeOutput(
-            generateGoClassLikes(runPhpDumps($options['php'], classLikeDumpCode())),
+            generateGoClassLikes(
+                runPhpDumps($options['php'], classLikeDumpCode()),
+                runPhpDumps($options['extensions-php'], classLikeDumpCode()),
+                runPhpDumps($options['pecl-php'], classLikeDumpCode()),
+                dirname(__DIR__, 2) . '/internal/stubs/php/extensions'
+            ),
             $options['output'] ?? dirname(__DIR__, 2) . '/internal/symbols/builtin_classes_generated.go'
         );
     },
