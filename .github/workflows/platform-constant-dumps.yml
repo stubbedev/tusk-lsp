@@ -1,0 +1,44 @@
+name: Platform constant dumps
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit that has scripts/generate-builtins/dumps/constants.php
+        required: true
+        default: feat/builtin-global-constants
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    name: ${{ matrix.os }} PHP ${{ matrix.php }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        php: ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5', '8.6']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          ini-file: development
+          extensions: bcmath, bz2, calendar, ctype, curl, dba, dom, exif, ffi, fileinfo, filter, ftp, gd, gettext, gmp, iconv, intl, ldap, mbstring, mysqli, opcache, openssl, pcntl, pdo_dblib, pdo_mysql, pdo_odbc, pdo_pgsql, pdo_sqlite, pgsql, posix, readline, shmop, simplexml, snmp, soap, sockets, sodium, sqlite3, sysvmsg, sysvsem, sysvshm, tidy, xml, xmlreader, xmlwriter, xsl, zip, zlib, redis, brotli, zstd
+      - name: Dump constants
+        shell: bash
+        run: |
+          mkdir -p dumps
+          php -v
+          php scripts/generate-builtins/dumps/constants.php > "dumps/${{ runner.os }}-${{ matrix.php }}.json"
+          php -r '$d = json_decode(file_get_contents($argv[1]), true, 512, JSON_THROW_ON_ERROR); echo $d["release"], " ", $d["os"], ": ", count($d["extensions"]), " extensions, ", array_sum(array_map("count", $d["constants"])), " constants\n", implode(" ", $d["extensions"]), "\n";' "dumps/${{ runner.os }}-${{ matrix.php }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: constants-${{ runner.os }}-${{ matrix.php }}
+          path: dumps/${{ runner.os }}-${{ matrix.php }}.json
+          if-no-files-found: error
