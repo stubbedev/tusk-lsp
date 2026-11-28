@@ -1,6 +1,8 @@
 name: Platform constant dumps
 
 on:
+  push:
+    branches: [ci/platform-constant-dumps]
   workflow_dispatch:
     inputs:
       ref:
@@ -23,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || 'feat/builtin-global-constants' }}
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
